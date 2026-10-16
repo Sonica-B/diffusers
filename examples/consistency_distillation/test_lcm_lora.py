@@ -19,6 +19,9 @@ import sys
 import tempfile
 
 import safetensors
+from peft import get_peft_model_state_dict
+
+from diffusers import StableDiffusionXLPipeline
 
 
 sys.path.append("..")
@@ -44,6 +47,7 @@ class TestTextToImageLCM(ExamplesTestsAccelerate):
                 --train_batch_size 1
                 --gradient_accumulation_steps 1
                 --max_train_steps 2
+                --validation_steps 2
                 --learning_rate 5.0e-04
                 --scale_lr
                 --lr_scheduler constant
@@ -51,14 +55,25 @@ class TestTextToImageLCM(ExamplesTestsAccelerate):
                 --output_dir {tmpdir}
                 """.split()
 
-            run_command(self._launch_args + test_args)
+            output = run_command(self._launch_args + test_args, return_stdout=True)
+            # intermediate validation must load the LoRA being trained into the UNet
+            assert "No LoRA keys associated to UNet2DConditionModel" not in output
+
             # save_pretrained smoke test
             assert os.path.isfile(os.path.join(tmpdir, "pytorch_lora_weights.safetensors"))
 
             # make sure the state_dict has the correct naming in the parameters.
             lora_state_dict = safetensors.torch.load_file(os.path.join(tmpdir, "pytorch_lora_weights.safetensors"))
-            is_lora = all("lora" in k for k in lora_state_dict.keys())
-            assert is_lora
+            is_peft_unet_lora = all(
+                k.startswith("unet.") and (".lora_A." in k or ".lora_B." in k) for k in lora_state_dict.keys()
+            )
+            assert is_peft_unet_lora
+
+            # every saved key, including the attention ones, must be loaded back into the UNet
+            pipe = StableDiffusionXLPipeline.from_pretrained("hf-internal-testing/tiny-stable-diffusion-xl-pipe")
+            pipe.load_lora_weights(tmpdir, adapter_name="lcm_lora")
+            loaded_keys = get_peft_model_state_dict(pipe.unet, adapter_name="lcm_lora").keys()
+            assert loaded_keys == {k.removeprefix("unet.") for k in lora_state_dict.keys()}
 
     def test_text_to_image_lcm_lora_sdxl_checkpointing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
